@@ -38,6 +38,21 @@ combining a base term, a random-walk term growing with the horizon
 so the 5%-95% band widens honestly with horizon -- the final horizon is
 ~4.5 days, far longer than the 90-minute practice horizon.
 
+Trend extrapolation is damped beyond the observed log-time range. A
+slope fitted over explosive launch-night growth cannot be trusted at
+full strength 4.5 days out: read at the target, a log-time line with
+slope ~8 predicts tracked players in the billions, so the forecast
+ends up entirely cap-driven (the N x30 cap, the +/-5 logit cap). The
+extrapolated increment is therefore scaled by span / (span + beyond),
+where span is the observed log-time range and beyond is how far past
+it the target sits. Inside the observed range the factor is 1; far
+beyond it the forecast tends back toward the fitted mean level instead
+of exploding to the caps. On a synthetic final-like case (5 refresh
+levels, 6510-minute horizon) this moves a story trophy's median from
+14% -- last read 0.38% -- to ~0.2%, in line with the rates' flat
+post-refresh path, while the practice cases are untouched (their
+history is a single level, so the stale branch fires either way).
+
 Standard library only, deterministic, no network, no randomness.
 """
 
@@ -155,6 +170,21 @@ def median(values):
     return s[m // 2] if m % 2 else 0.5 * (s[m // 2 - 1] + s[m // 2])
 
 
+def extrap_damp(x_target, x_lo, x_hi):
+    """Factor shrinking a trend extrapolation past the observed x-range.
+
+    Returns span / (span + beyond), where span = x_hi - x_lo is the
+    log-time range the fits were estimated over and beyond is how far
+    past x_hi the target sits. 1 while the target is inside the range;
+    tends to 0 as the target moves far beyond it, so a slope fitted on
+    launch-night growth is not read at full strength days later.
+    """
+    span = x_hi - x_lo
+    beyond = max(x_target - x_hi, 0.0)
+    denom = span + beyond
+    return span / denom if denom > 1e-12 else 1.0
+
+
 def forecast_case(case):
     trophies = case["trophies"]
     history = case.get("history") or []
@@ -231,8 +261,12 @@ def forecast_case(case):
             med_rate = 100.0 * e_star / n_star
             sigma = 1.0
         else:
-            a_n, b_n = n_fit[0], n_fit[1]
-            n_star = math.exp(a_n + b_n * x_target)
+            # Damp the trend past the observed log-time range: the target
+            # sits far beyond the history's last read, and the launch
+            # slopes must not be read at full strength out there.
+            damp = extrap_damp(x_target, xs[0], xs[-1])
+            _, b_n, _, mx_n, my_n = n_fit
+            n_star = math.exp(my_n + b_n * (x_target - mx_n) * damp)
             n_star = min(max(n_star, float(n_last)), float(n_last) * 30.0)
             fit = e_fits[j]
             if fit is not None:
@@ -246,12 +280,12 @@ def forecast_case(case):
                 )
                 w = n_used / (n_used + 4.0)
                 b_s = w * b_e + (1.0 - w) * pooled_slope + SLOPE_NUDGE[kind]
-                log_e_star = my + b_s * (x_target - mx)
+                log_e_star = my + b_s * (x_target - mx) * damp
                 resid_s = min(max(0.5 * resid + 0.5 * pooled_resid, 0.15), 1.0)
             else:
                 b_s = pooled_slope + SLOPE_NUDGE[kind]
                 earners_last = max(last_rate * n_last / 100.0, 0.5)
-                log_e_star = math.log(earners_last) + b_s * max(x_target - xs[-1], 0.0)
+                log_e_star = math.log(earners_last) + b_s * max(x_target - xs[-1], 0.0) * damp
                 resid_s = 0.5
             e_star = math.exp(log_e_star)
             e_star = min(max(e_star, 0.25), n_star)
