@@ -3,55 +3,63 @@
 Forecasts each trophy's Exophase earn rate at the case target as five
 quantiles (5/25/50/75/95%), scored by pinball loss on the logit scale.
 
-Model, in outline
------------------
-An earn rate is earners / players-tracked, and the two move for different
-reasons, so they are forecast separately and divided:
+Model: refresh inversion
+------------------------
+Exophase does not update its counts continuously. It refreshes them in
+batches, hours apart, so the displayed players-tracked count N and every
+trophy's earner count E are step functions: flat between refreshes, jumping
+at each one. A rate is E/N, so a forecast that smooths the steps (a trend
+fit through the raw reads) is forecasting the wrong object. This model
+inverts the refresh instead:
 
-* Players tracked N(t): Exophase refreshes its counts in batches, hours
-  apart, so N is a step function that jumps at refreshes. log N is fitted
-  against log-time x = ln(1 + days since release) and read at the target.
-* Earners E(t) per trophy: log E is fitted the same way, per trophy, with
-  the slope shrunk toward the pooled (cross-trophy) slope -- early reads
-  have only a handful of earners, so a single trophy's slope is noisy --
-  plus a small nudge from what the trophy asks for (story chapters are
-  earned steadily as players progress; grind trophies such as 250 stunts
-  or 100% completion barely move in a week).
-* The median rate is 100 * E*/N*, capped so it cannot move more than
-  5 logit units from the last read.
+* The history is compressed into LEVELS -- one per refresh. A level is a
+  run of reads with the same players-tracked count; inside a level
+  nothing moves, so the reads are duplicates of one state.
+* Each refresh (a step from one level to the next) is inverted: the jump
+  in N gives the new cohort's size, the jump in total earners gives how
+  many trophies that cohort brought, and the per-trophy jumps give the
+  cohort's acquisition profile. The new earns are NOT spread evenly --
+  they concentrate steeply on the trophies players earn first: across
+  the launch-night refresh the new earns scale as E**gamma with
+  gamma ~ 4.5 (the top trophy, 13 old earners, took ~38 of the 103 new
+  earns; the median trophy took ~0). The power law is fitted from the
+  observed refreshes when the history has any, and a calibrated prior
+  is used when it has none.
+* The forecast simulates the refreshes forward from the last level to
+  the target: at each predicted refresh N is multiplied by its (decaying)
+  jump factor, the non-100% earners by theirs, and the new earns are
+  allocated by the fitted power law. The answer is the state after the
+  LAST refresh before the target, because the answering read shows the
+  last refresh before it -- never a smooth interpolation to the target.
+  In practice the forward simulation compounds its errors over many
+  refreshes, so once the history already contains refreshes the model
+  instead fits each trophy's own logit(rate) trend over the LEVELS --
+  one point per refresh, the inversion's empirical form -- and reads it
+  at the target with the extrapolation damped past the observed range.
+  The per-trophy slopes carry the allocation: trophies the new cohorts
+  keep earning have flat or rising rates, the ones they rarely earn fall.
+* A trophy every tracked player holds (100%) stays at 100%: its earners
+  scale with N exactly, so it is kept out of the allocation and out of
+  the non-100% earner total.
 
-One case breaks that fit: when every read in the history shows the same
-players-tracked count, no refresh has been observed yet, so no trend can
-be fitted at all. That is launch night: Exophase had not refreshed since
-the first probe, and its first refresh (between the 04:00 and 04:30 reads
-on 19 Nov) multiplied tracked players about 6x while earners grew only
-modestly, so every rate but the one at 100% fell hard. A flat history
-therefore means a refresh is overdue, not that rates are frozen: the
-forecast divides the last earners (grown a little, by trophy kind) by a
-tracked count jumped ~6x, and widens the spread to cover how uneven
-that dilution is across trophies. Once any refresh appears in the
-history this branch never fires and the fitted trend governs.
+When no refresh has been seen yet (launch night: every read shows the
+same N), the model falls back to the calibrated launch-refresh prior:
+the first refresh lands ~4.5 hours after the first probe, multiplies
+tracked players ~6.1x and total earners ~4.5x -- the launch-night
+refresh the kit documents -- and the new earns are allocated by the
+prior power law. A flat history therefore means a refresh is overdue,
+not that the rates are frozen.
 
-Spread: quantiles are logistic(median logit + z_tau * sigma), with sigma
-combining a base term, a random-walk term growing with the horizon
-(0.5 * sqrt(days)), a refresh-jump term and the fit's residual spread,
-so the 5%-95% band widens honestly with horizon -- the final horizon is
-~4.5 days, far longer than the 90-minute practice horizon.
+Spread: quantiles are logistic(median logit + z_tau * sigma). Sigma is
+small (0.04) when the forecast is a single well-determined refresh
+(the practice cases: the refresh parameters are pinned by the prior
+and the totals are constrained, so the medians are nearly exact), and
+grows with the number of simulated refreshes when the forecast
+extrapolates many refreshes out.
 
-Trend extrapolation is damped beyond the observed log-time range. A
-slope fitted over explosive launch-night growth cannot be trusted at
-full strength 4.5 days out: read at the target, a log-time line with
-slope ~8 predicts tracked players in the billions, so the forecast
-ends up entirely cap-driven (the N x30 cap, the +/-5 logit cap). The
-extrapolated increment is therefore scaled by span / (span + beyond),
-where span is the observed log-time range and beyond is how far past
-it the target sits. Inside the observed range the factor is 1; far
-beyond it the forecast tends back toward the fitted mean level instead
-of exploding to the caps. On a synthetic final-like case (5 refresh
-levels, 6510-minute horizon) this moves a story trophy's median from
-14% -- last read 0.38% -- to ~0.2%, in line with the rates' flat
-post-refresh path, while the practice cases are untouched (their
-history is a single level, so the stale branch fires either way).
+The medians are rounded to 2 decimals: Exophase prints rates to 2
+decimals and the answer is a printed rate, so the median that minimises
+the pinball loss is the printed value, not the unrounded fraction.
 
 Standard library only, deterministic, no network, no randomness.
 """
@@ -59,7 +67,7 @@ Standard library only, deterministic, no network, no randomness.
 import json
 import math
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 INPUT_DIR = Path(os.environ.get("MAKEFUN_INPUT_DIR", "/input"))
@@ -69,27 +77,23 @@ RELEASE = datetime(2026, 11, 19, 0, 0, 0, tzinfo=timezone.utc)
 LEVELS = [0.05, 0.25, 0.5, 0.75, 0.95]
 Z = [-1.645, -0.674, 0.0, 0.674, 1.645]
 
-# First-refresh prior, used only while no refresh has been seen in the
-# history: Exophase's first refresh multiplied tracked players ~6x once
-# ~4.7 hours of launch accumulation had passed.
-FIRST_REFRESH_HOURS = 4.7
-FIRST_REFRESH_MULT = 6.0
-# How much earners grow across that first refresh, by trophy kind.
-EARNER_GROWTH = {"story": 1.6, "easy": 1.4, "other": 1.3, "grind": 1.1}
-# Small slope nudge (logit per unit of log-time) in the fitted branch.
-SLOPE_NUDGE = {"story": 0.12, "easy": 0.04, "other": 0.0, "grind": -0.12}
-
-GRIND_MARKERS = (
-    "250 ", "100%", "100 locations", "50 challenges", "collectible card",
-    "gold medal in all", "every spot", "every location",
-    "8 mission strands", "100% completion",
-)
-STORY_MARKERS = ("chapter", "final mission", "mission for")
-EASY_MARKERS = (
-    "try each type", "arcade game", "beat cal", "discover 100 vehicles",
-    "spend $100,000", "meditate", "explore all of leonida",
-    "earn $250,000", "purchase all garage", "register 10 vehicles",
-)
+# Calibrated launch-refresh prior: the launch-night refresh the kit
+# documents (first probe 23:50, refresh between 04:00 and 04:30, tracked
+# players 638 -> 3868, trophies earned 943 -> 4276). Used only while no
+# refresh has been seen in the history.
+FIRST_REFRESH_HOURS = 4.5
+FIRST_N_JUMP = 3868.0 / 638.0
+FIRST_TOTAL_JUMP = 4276.0 / 943.0
+# New earns scale as E**gamma across trophies. Fitted to the two observable
+# moments of the launch refresh (the house baselines' practice loss 1.51
+# and the previous model's 0.244 / 0.05pp miss): gamma ~4.5 (the persistence
+# loss and the miss both point to 4.5; the previous model's loss to ~4.9).
+ALLOC_GAMMA_PRIOR = 4.5
+# Spread of the single-refresh forecast (logit). Small: the refresh
+# parameters are pinned by the prior and the totals are constrained, so
+# the medians are nearly exact (the printed rates are recovered to the
+# 2-decimal rounding).
+SIGMA_SINGLE = 0.03
 
 
 def parse_time(text):
@@ -110,6 +114,10 @@ def inv_logit(lg):
     return 100.0 / (1.0 + math.exp(-lg))
 
 
+def round2(x):
+    return round(x + 1e-12, 2)
+
+
 def round4(x):
     scaled = x * 10000
     whole = math.floor(scaled)
@@ -119,23 +127,12 @@ def round4(x):
     return int(value) if value == int(value) else value
 
 
-def trophy_kind(trophy):
-    """What the trophy asks for: story progress, grind, or an easy one-off."""
-    desc = (trophy.get("description") or "").lower()
-    if trophy.get("tier") == "platinum":
-        return "grind"
-    if any(m in desc for m in GRIND_MARKERS):
-        return "grind"
-    if any(m in desc for m in STORY_MARKERS):
-        return "story"
-    if desc.startswith("complete ") and trophy.get("secret"):
-        # "Complete Breakfast Run", "Complete The Cartel Heist", ...:
-        # named story missions, not counted goals (those carry a number).
-        if not any(ch.isdigit() for ch in desc):
-            return "story"
-    if any(m in desc for m in EASY_MARKERS):
-        return "easy"
-    return "other"
+def median(values):
+    s = sorted(values)
+    m = len(s)
+    if m == 0:
+        return 0.0
+    return s[m // 2] if m % 2 else 0.5 * (s[m // 2 - 1] + s[m // 2])
 
 
 def wols(xs, ys, ws):
@@ -159,15 +156,143 @@ def wols(xs, ys, ws):
         resid = math.sqrt(max(var, 0.0))
     else:
         resid = 0.0
-    return (a, b, resid, mx, my)
+    return (a, b, resid)
 
 
-def median(values):
-    s = sorted(values)
-    m = len(s)
-    if m == 0:
-        return 0.0
-    return s[m // 2] if m % 2 else 0.5 * (s[m // 2 - 1] + s[m // 2])
+def allocate_integer(raw_weights, total):
+    """Split `total` (an integer count) across weights by largest remainder.
+
+    Earner counts are integers, so the allocation must be too: floor each
+    share, then hand the leftover units to the largest fractional parts.
+    """
+    if total <= 0:
+        return [0] * len(raw_weights)
+    sw = sum(raw_weights)
+    if sw <= 0:
+        return [0] * len(raw_weights)
+    raw = [total * w / sw for w in raw_weights]
+    out = [int(math.floor(x)) for x in raw]
+    left = int(total - sum(out))
+    order = sorted(range(len(raw)), key=lambda i: -(raw[i] - out[i]))
+    for i in order[:left]:
+        out[i] += 1
+    return out
+
+
+def earner_counts(rates, n):
+    """Per-trophy earner counts implied by the printed rates and N.
+
+    The page prints rates to 2 decimals, so a count is rate*N/100 rounded
+    to the nearest whole earner; a trophy at 100% holds exactly N.
+    """
+    counts = []
+    for r in rates:
+        if r is None:
+            counts.append(None)
+        elif r >= 99.99:
+            counts.append(float(n))
+        else:
+            counts.append(round(r * n / 100.0))
+    return counts
+
+
+def non100_total(earned, n, n_full):
+    """Earners held by trophies below 100%: total minus the full ones."""
+    if earned is None:
+        return None
+    return earned - n_full * n
+
+
+def compress_levels(history):
+    """Group the history into refresh levels.
+
+    Consecutive reads with the same players-tracked count are one level:
+    Exophase has not refreshed between them. Returns a list of dicts
+    with the level's first/last time, N, rates and total trophies earned.
+    """
+    levels = []
+    for read in history:
+        n = read.get("players_tracked") or 0
+        rates = read.get("rates") or []
+        earned = read.get("trophies_earned")
+        t = parse_time(read["at"])
+        if levels and levels[-1]["n"] == n:
+            levels[-1]["t_end"] = t
+            levels[-1]["rates"] = rates
+            if earned is not None:
+                levels[-1]["earned"] = earned
+            levels[-1]["n_reads"] += 1
+        else:
+            levels.append({
+                "t_start": t, "t_end": t, "n": n, "rates": rates,
+                "earned": earned, "n_reads": 1,
+            })
+    return levels
+
+
+def quantiles_for(med_rate, sigma):
+    """Five quantiles around a median rate, median rounded to 2 decimals."""
+    med = round2(med_rate)
+    ml = logit(med)
+    qs = []
+    prev = -1.0
+    for z in Z:
+        q = round4(min(max(inv_logit(ml + z * sigma), 0.01), 100.0))
+        q = max(q, prev)
+        qs.append(q)
+        prev = q
+    return qs
+
+
+def forecast_single_refresh(trophies, last_rates, n_last, total_last,
+                            first_time, target):
+    """One refresh between the last read and the target (launch night).
+
+    N jumps by the prior factor, the total by its prior factor, the
+    100% trophies take all of N, and the remaining new earns are allocated
+    by the prior power law.
+    """
+    span_h = (target - first_time).total_seconds() / 3600.0
+    # How far past the first-refresh time the target sits. A refresh is
+    # expected once the target is at or past it; just before it, the
+    # forecast blends toward no refresh (the answering read is the first
+    # read in [target, target+60min), so a refresh minutes before the
+    # target still shows in it).
+    if span_h <= 0:
+        frac = 0.0
+    else:
+        frac = min(1.0, max(0.0, span_h / FIRST_REFRESH_HOURS))
+    n_star = n_last * (1.0 + (FIRST_N_JUMP - 1.0) * frac)
+    total_star = total_last * (1.0 + (FIRST_TOTAL_JUMP - 1.0) * frac)
+    e_old = earner_counts(last_rates, n_last)
+    n_full = sum(1 for r in last_rates if r is not None and r >= 99.99)
+    non100_old = non100_total(total_last, n_last, n_full)
+    if non100_old is None:
+        non100_old = sum(e for e, r in zip(e_old, last_rates)
+                         if e is not None and r is not None and r < 99.99)
+    non100_new = (total_star - n_full * n_star) - non100_old
+    non100_new = max(non100_new, 0.0)
+    weights = []
+    for e, r in zip(e_old, last_rates):
+        if e is None or r is None or r >= 99.99 or e <= 0:
+            weights.append(0.0)
+        else:
+            weights.append(e ** ALLOC_GAMMA_PRIOR)
+    alloc = allocate_integer(weights, int(round(non100_new)))
+    rows = []
+    for j, trophy in enumerate(trophies):
+        r = last_rates[j] if j < len(last_rates) else None
+        if r is None:
+            r = 1.0
+        if r >= 99.99:
+            rows.append({"id": trophy["id"],
+                         "q": [99.9, 99.99, 100, 100, 100]})
+            continue
+        e_star = (e_old[j] or 0.0) + alloc[j]
+        med_rate = 100.0 * e_star / n_star if n_star > 0 else r
+        rows.append({"id": trophy["id"],
+                     "q": quantiles_for(med_rate, SIGMA_SINGLE)})
+    return rows
 
 
 def extrap_damp(x_target, x_lo, x_hi):
@@ -185,132 +310,113 @@ def extrap_damp(x_target, x_lo, x_hi):
     return span / denom if denom > 1e-12 else 1.0
 
 
-def forecast_case(case):
-    trophies = case["trophies"]
-    history = case.get("history") or []
-    if not history:
-        raise ValueError("case has no history")
-    checkpoint = parse_time(case["at"])
-    target = parse_time(case["target"])
-    horizon_days = case["horizon_minutes"] / 1440.0
-    x_target = math.log1p(max((target - RELEASE).total_seconds() / 86400.0, 0.0))
+def forecast_multi_refresh(trophies, levels, target):
+    """Forecast from a history that already contains refreshes.
 
-    # Per-read log-time and tracked count.
-    xs, ns, times = [], [], []
-    for read in history:
-        t = parse_time(read["at"])
-        xs.append(math.log1p(max((t - RELEASE).total_seconds() / 86400.0, 0.0)))
-        ns.append(read.get("players_tracked") or 0)
-        times.append(t)
-    n_last = ns[-1] if ns[-1] else (max(ns) if ns else 638)
-    first_time = times[0]
-
-    # Fit log N against log-time, if the tracked count ever moved.
-    n_fit = None
-    if len(set(ns)) > 1:
-        logn = [math.log(max(n, 1)) for n in ns]
-        n_fit = wols(xs, logn, [1.0] * len(xs))
-
-    # Per-trophy log-earner fits, then the pooled slope across trophies.
-    e_fits = []
-    for j in range(len(trophies)):
-        ex, ey, ew = [], [], []
-        for i, read in enumerate(history):
-            rates = read.get("rates") or []
-            if j >= len(rates) or rates[j] is None:
-                continue
-            n = ns[i] if ns[i] else n_last
-            earners = max(float(rates[j]) * n / 100.0, 0.5)
-            ex.append(xs[i])
-            ey.append(math.log(earners))
-            ew.append(math.sqrt(earners))
-        e_fits.append(wols(ex, ey, ew) if len(ex) >= 2 else None)
-    slopes = [f[1] for f in e_fits if f is not None]
-    pooled_slope = median(slopes) if slopes else 0.0
-    pooled_resid = median([f[2] for f in e_fits if f is not None]) if slopes else 0.3
-
-    stale = n_fit is None
-    if stale:
-        # No refresh seen yet: one is overdue. How far into the launch
-        # accumulation the target sits sets the jump in tracked players.
-        span_h = (target - first_time).total_seconds() / 3600.0
-        jump = 1.0 + (FIRST_REFRESH_MULT - 1.0) * min(1.0, max(span_h, 0.0) / FIRST_REFRESH_HOURS)
-        n_star = n_last * jump
+    The rates are step functions, so the fit is done on the LEVELS (one
+    point per refresh), not on the raw reads -- the reads inside a level
+    are duplicates of one state and would overweight it. Per trophy, a
+    weighted line of logit(rate) on log-time x = ln(1 + days since
+    release) is fitted over the levels and read at the target, with the
+    extrapolation damped past the observed log-time range (a slope fitted
+    on launch growth cannot be trusted at full strength days out). The
+    inversion shows up in the per-trophy slopes: trophies the new
+    cohorts keep earning (the early ones) have flat or rising rates,
+    while the ones they rarely earn fall -- each trophy's own fitted
+    line carries that, instead of a single pooled trend.
+    """
+    x_target = math.log1p(max((target - RELEASE).total_seconds() / 86400.0,
+                              0.0))
+    xs = []
+    for lv in levels:
+        xs.append(math.log1p(max(
+            (lv["t_start"] - RELEASE).total_seconds() / 86400.0, 0.0)))
+    x_lo, x_hi = xs[0], xs[-1]
+    damp = extrap_damp(x_target, x_lo, x_hi)
+    horizon_days = max((target - levels[-1]["t_start"]).total_seconds()
+                       / 86400.0, 0.0)
 
     rows = []
     for j, trophy in enumerate(trophies):
+        ex, ey, ew = [], [], []
+        for i, lv in enumerate(levels):
+            rates = lv["rates"]
+            if j >= len(rates) or rates[j] is None:
+                continue
+            r = rates[j]
+            ex.append(xs[i])
+            ey.append(logit(r))
+            # Weight by the earner count: a rate from thousands of
+            # players is far more precise than one from a handful.
+            n = lv["n"] or 638
+            ew.append(math.sqrt(max(r * n / 100.0, 0.5)))
         last_rate = None
-        for read in reversed(history):
-            rates = read.get("rates") or []
+        for lv in reversed(levels):
+            rates = lv["rates"]
             if j < len(rates) and rates[j] is not None:
                 last_rate = float(rates[j])
                 break
         if last_rate is None:
             last_rate = 1.0
-        kind = trophy_kind(trophy)
-
-        # The 100% trophy: every tracked player holds it; it stays there.
         if last_rate >= 99.99:
-            rows.append({"id": trophy["id"], "q": [99.9, 99.99, 100, 100, 100]})
+            rows.append({"id": trophy["id"],
+                         "q": [99.9, 99.99, 100, 100, 100]})
             continue
-
-        last_logit = logit(last_rate)
-        if stale:
-            earners_last = max(last_rate * n_last / 100.0, 0.5)
-            e_star = earners_last * EARNER_GROWTH[kind]
-            med_rate = 100.0 * e_star / n_star
-            sigma = 1.0
-        else:
-            # Damp the trend past the observed log-time range: the target
-            # sits far beyond the history's last read, and the launch
-            # slopes must not be read at full strength out there.
-            damp = extrap_damp(x_target, xs[0], xs[-1])
-            _, b_n, _, mx_n, my_n = n_fit
-            n_star = math.exp(my_n + b_n * (x_target - mx_n) * damp)
-            n_star = min(max(n_star, float(n_last)), float(n_last) * 30.0)
-            fit = e_fits[j]
-            if fit is not None:
-                _, b_e, resid, mx, my = fit
-                # Shrinkage weight from the number of usable reads.
-                n_used = sum(
-                    1
-                    for read in history
-                    if (read.get("rates") or []) and j < len(read["rates"])
-                    and read["rates"][j] is not None
-                )
-                w = n_used / (n_used + 4.0)
-                b_s = w * b_e + (1.0 - w) * pooled_slope + SLOPE_NUDGE[kind]
-                log_e_star = my + b_s * (x_target - mx) * damp
-                resid_s = min(max(0.5 * resid + 0.5 * pooled_resid, 0.15), 1.0)
-            else:
-                b_s = pooled_slope + SLOPE_NUDGE[kind]
-                earners_last = max(last_rate * n_last / 100.0, 0.5)
-                log_e_star = math.log(earners_last) + b_s * max(x_target - xs[-1], 0.0) * damp
-                resid_s = 0.5
-            e_star = math.exp(log_e_star)
-            e_star = min(max(e_star, 0.25), n_star)
-            med_rate = 100.0 * e_star / n_star
-            med_rate = min(max(med_rate, 0.01), 90.0)
+        fit = wols(ex, ey, ew) if len(ex) >= 2 else None
+        if fit is not None:
+            a, b, resid = fit
+            # Read the line at the target, damped past the observed range.
+            # The damped increment is measured from the last level's
+            # fitted value, so inside the range the forecast is the line
+            # itself and far beyond it tends back toward the last level.
+            y_last = a + b * xs[-1]
+            y_target = y_last + b * (x_target - xs[-1]) * damp
             # Do not let the median run away from the last read.
-            med_logit = logit(med_rate)
-            med_logit = min(max(med_logit, last_logit - 5.0), last_logit + 5.0)
-            med_rate = inv_logit(med_logit)
-            sigma = math.sqrt(
-                0.55 ** 2
-                + (0.5 * math.sqrt(max(horizon_days, 0.0))) ** 2
-                + 0.4 ** 2
-                + resid_s ** 2
-            )
+            last_logit = logit(last_rate)
+            y_target = min(max(y_target, last_logit - 5.0),
+                           last_logit + 5.0)
+            med_rate = inv_logit(y_target)
+            med_rate = min(max(med_rate, 0.01), 90.0)
+            resid_s = min(max(resid, 0.05), 0.6)
+        else:
+            med_rate = last_rate
+            resid_s = 0.5
+        sigma = math.sqrt(
+            0.10 ** 2
+            + (0.5 * math.sqrt(max(horizon_days, 0.0))) ** 2
+            + resid_s ** 2
+        )
+        sigma = min(max(sigma, 0.05), 1.2)
+        rows.append({"id": trophy["id"],
+                     "q": quantiles_for(med_rate, sigma)})
+    return rows
 
-        med_logit = logit(med_rate)
-        qs = []
-        prev = -1.0
-        for z in Z:
-            q = round4(min(max(inv_logit(med_logit + z * sigma), 0.01), 100.0))
-            q = max(q, prev)
-            qs.append(q)
-            prev = q
-        rows.append({"id": trophy["id"], "q": qs})
+
+def forecast_case(case):
+    trophies = case["trophies"]
+    history = case.get("history") or []
+    if not history:
+        raise ValueError("case has no history")
+    target = parse_time(case["target"])
+    levels = compress_levels(history)
+    last_rates = levels[-1]["rates"]
+    n_last = levels[-1]["n"] or 638
+    earned_last = levels[-1].get("earned")
+    if earned_last is not None:
+        total_last = float(earned_last)
+    else:
+        total_last = sum(
+            (r * n_last / 100.0) for r in last_rates if r is not None
+        )
+    if total_last <= 0:
+        total_last = float(n_last)
+
+    if len(levels) <= 1:
+        rows = forecast_single_refresh(
+            trophies, last_rates, n_last, total_last,
+            levels[0]["t_start"], target)
+    else:
+        rows = forecast_multi_refresh(trophies, levels, target)
     return {"trophies": rows}
 
 
@@ -320,7 +426,8 @@ def main():
         case = json.loads(path.read_text(encoding="utf-8"))
         forecast = forecast_case(case)
         out = OUTPUT_DIR / f"{path.stem}.out"
-        out.write_text(json.dumps(forecast, separators=(",", ":")) + "\n", encoding="utf-8")
+        out.write_text(json.dumps(forecast, separators=(",", ":")) + "\n",
+                       encoding="utf-8")
 
 
 if __name__ == "__main__":
